@@ -3,6 +3,7 @@
  ******************************************************************************/
 
 // Include these 2 headers instead of torch/extension.h since we don't need all of the torch headers.
+#include <torch/python.h>
 #include <torch/nn/functional.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
@@ -474,23 +475,22 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
         params, batch_size, num_heads, head_size, seqlen_k, seqlen_q,
         head_size_rounded, p_dropout, /*num_splits*/ 0, get_num_sm(get_current_device()), opts);
 
-    // NOTE(woosuk): Commented out because they are not used in inference.
-    // // number of times random will be generated per thread, to offset philox counter in thc random
-    // // state
-    // // We use a custom RNG that increases the offset by batch_size * nheads * 32.
-    // int64_t counter_offset = params.b * params.h * 32;
-    // auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
-    // auto rng_state = torch::empty({2}, options.dtype(torch::kInt64));
-    // // Forward kernel will populate memory with the seed and offset.
-    // params.rng_state = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
+    // number of times random will be generated per thread, to offset philox counter in thc random
+    // state
+    // We use a custom RNG that increases the offset by batch_size * nheads * 32.
+    int64_t counter_offset = params.b * params.h * 32;
+    auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+    auto rng_state = torch::empty({2}, options.dtype(torch::kInt64));
+    // Forward kernel will populate memory with the seed and offset.
+    params.rng_state = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
 
-    // if (p_dropout > 0.0)  {
-    //     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
-    //         gen_, at::cuda::detail::getDefaultCUDAGenerator());
-    //     // See Note [Acquire lock when using random generators]
-    //     std::lock_guard<std::mutex> lock(gen->mutex_);
-    //     params.philox_args = gen->philox_cuda_state(counter_offset);
-    // }
+    if (p_dropout > 0.0)  {
+        auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
+            gen_, at::cuda::detail::getDefaultCUDAGenerator());
+        // See Note [Acquire lock when using random generators]
+        std::lock_guard<std::mutex> lock(gen->mutex_);
+        params.philox_args = gen->philox_cuda_state(counter_offset);
+    }
 
     set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
 
@@ -508,8 +508,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
         q = q.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, head_size});
         softmax_lse = softmax_lse.reshape({batch_size, num_heads_k * seqlen_q, 1});
     }
-
-    return {out, softmax_lse};
+    return {out, softmax_lse, p, rng_state};
 }
 
 std::vector<at::Tensor>
@@ -533,8 +532,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                int window_size_right,
                const float softcap,
                const bool return_softmax,
-               int num_splits,
-               std::optional<at::Generator> gen_) {
+               std::optional<at::Generator> gen_,
+               int num_splits = 0) {
 
     // Otherwise the kernel will be launched from cuda:0 device
     at::cuda::CUDAGuard device_guard{q.device()};
@@ -582,7 +581,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     const int max_num_blocks_per_seq = !paged_KV ? 0 : block_table.size(1);
     const int num_blocks = !paged_KV ? 0 : k.size(0);
     const int page_block_size = !paged_KV ? 1 : k.size(1);
-    TORCH_CHECK(!paged_KV || page_block_size % 16 == 0, "Paged KV cache block size must be divisible by 16");
+    TORCH_CHECK(!paged_KV || page_block_size % 256 == 0, "Paged KV cache block size must be divisible by 256");
 
     if (max_seqlen_q == 1 && !alibi_slopes_.has_value()) { is_causal = false; }  // causal=true is the same as causal=false in this case
     if (is_causal) { window_size_right = 0; }
@@ -639,10 +638,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
         CHECK_SHAPE(out, sizes[0], sizes[1], head_size);
         if (seqlenq_ngroups_swapped) {
-            // NOTE(woosuk): We create a temporary buffer and copy the result to the `out_` tensor eventually.
-            // This is because we reshaped the `q` tensor for the splik-KV optimization, and the `out_` tensor
-            // has the same shape as the original `q` tensor, not the reshaped one.
-            out = torch::empty_like(q);
+            out = out.reshape({batch_size, num_heads_k, ngroups, head_size}).transpose(1, 2).reshape({batch_size * ngroups, num_heads_k, head_size});
         }
     } else {
         out = torch::empty_like(q);
@@ -703,11 +699,13 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     // Keep references to these tensors to extend their lifetime
     at::Tensor softmax_lse_accum, out_accum;
     if (seqlenq_ngroups_swapped) {
-        // Only apply split-k for decoding
         std::tie(softmax_lse_accum, out_accum) =
             set_params_splitkv(params, batch_size, num_heads, head_size,
                                max_seqlen_k, max_seqlen_q, head_size_rounded,
                                p_dropout, num_splits, get_num_sm(get_current_device()), opts);
+    } else if (paged_KV) {
+        TORCH_CHECK(num_splits <= 1, "num_splits > 1 is not supported for varlen paged KV");
+        params.num_splits = num_splits;
     }
 
     if (leftpad_k_.has_value()) {
@@ -720,23 +718,22 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         params.leftpad_k = static_cast<int *>(leftpad_k.data_ptr());
     }
 
-    // NOTE(woosuk): Commented out because they are not used in inference.
     // number of times random will be generated per thread, to offset philox counter in thc random
     // state
     // We use a custom RNG that increases the offset by batch_size * nheads * 32.
-    // int64_t counter_offset = params.b * params.h * 32;
-    // auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
-    // auto rng_state = torch::empty({2}, options.dtype(torch::kInt64));
-    // // Forward kernel will populate memory with the seed and offset.
-    // params.rng_state = reinterpret_cast<uinpft64_t*>(rng_state.data_ptr());
+    int64_t counter_offset = params.b * params.h * 32;
+    auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+    auto rng_state = torch::empty({2}, options.dtype(torch::kInt64));
+    // Forward kernel will populate memory with the seed and offset.
+    params.rng_state = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
 
-    // if (p_dropout > 0.0)  {
-    //     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
-    //         gen_, at::cuda::detail::getDefaultCUDAGenerator());
-    //     // See Note [Acquire lock when using random generators]
-    //     std::lock_guard<std::mutex> lock(gen->mutex_);
-    //     params.philox_args = gen->philox_cuda_state(counter_offset);
-    // }
+    if (p_dropout > 0.0)  {
+        auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
+            gen_, at::cuda::detail::getDefaultCUDAGenerator());
+        // See Note [Acquire lock when using random generators]
+        std::lock_guard<std::mutex> lock(gen->mutex_);
+        params.philox_args = gen->philox_cuda_state(counter_offset);
+    }
 
     set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
 
@@ -752,39 +749,15 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     if (seqlenq_ngroups_swapped) {
         int64_t size_before[] = {batch_size, max_seqlen_q, num_heads_k, head_size};
         int64_t size_after[] = {batch_size, num_heads_k * max_seqlen_q, head_size};
-        out = out.reshape(size_before).transpose(1, 2);
-        if (out_.has_value()) {
-            // NOTE(woosuk): In this case, we should avoid `out.reshape(size_after)` because it causes
-            // a redundant clone operation. Instead, we directly copy the result to the `out_` tensor.
-            out_.value().view({batch_size, num_heads_k, max_seqlen_q, head_size}).copy_(out);
-            out = out_.value();
-        } else {
-            out = out.reshape(size_after);
-        }
-        // NOTE(woosuk): The two lines are not needed because out_padded and q_padded are not used.
-        // out_padded = out_padded.reshape(size_before).transpose(1, 2).reshape(size_after);
-        // q_padded = q_padded.reshape(size_before).transpose(1, 2).reshape(size_after);
-        int64_t lse_size_before[] = {num_heads, batch_size, max_seqlen_q};
-        int64_t lse_size_after[] = {num_heads * max_seqlen_q, batch_size};
-        
-        
-        if (params.num_splits > 1){
-            // When KV-split is enabled (num_splits > 1), LSE is first computed partially through lse_accum tensors. Then, an additional kernel, combine_attn_seqk_parallel, reduces these partials into the final LSE. 
-            // This kernel produces LSE in a [seqlen_q, h, b] layout which can be directly used as it is already in the canonical form.
-            softmax_lse = softmax_lse.reshape(lse_size_after); 
-        }else{
-            // The standard forward kernel produces LSE in a [b, h, seqlen_q] layout.
-            // It must be transposed to the canonical [seqlen_q, h, b] layout.
-            softmax_lse = softmax_lse.reshape(lse_size_before).transpose(1, 2).reshape(lse_size_after);
-        }
-        
+        out = out.reshape(size_before).transpose(1, 2).reshape(size_after);
+        q = q.reshape(size_before).transpose(1, 2).reshape(size_after);
+        softmax_lse = softmax_lse.reshape({num_heads * max_seqlen_q, batch_size});
     }
 
-    return {out, softmax_lse};
+    return {out, softmax_lse, p, rng_state};
 }
 
 void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
-#ifndef FLASHATTENTION_DISABLE_BACKWARD
     FP16_SWITCH(!params.is_bf16, [&] {
         HEADDIM_SWITCH(params.d, [&] {
             BOOL_SWITCH(params.is_causal, Is_causal, [&] {
@@ -792,9 +765,6 @@ void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
             });
         });
     });
-#else
-    TORCH_CHECK(false, "This flash attention build does not support backward.");
-#endif
 }
 
 std::vector<at::Tensor>
@@ -1290,13 +1260,11 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     int seqlen_q = sizes[1];
     int num_heads = sizes[2];
     const int head_size_og = sizes[3];
-    const int seqlen_q_og = seqlen_q;
-    const int num_heads_og = num_heads;
 
     const int max_num_blocks_per_seq = !paged_KV ? 0 : block_table.size(1);
     const int num_blocks = !paged_KV ? 0 : kcache.size(0);
     const int page_block_size = !paged_KV ? 1 : kcache.size(1);
-    TORCH_CHECK(!paged_KV || page_block_size % 16 == 0, "Paged KV cache block size must be divisible by 16");
+    TORCH_CHECK(!paged_KV || page_block_size % 256 == 0, "Paged KV cache block size must be divisible by 256");
     const int seqlen_k = !paged_KV ? kcache.size(1) : max_num_blocks_per_seq * page_block_size;
     const int num_heads_k = kcache.size(2);
     const int batch_size_c = !paged_KV ? kcache.size(0) : batch_size;
@@ -1348,12 +1316,8 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         TORCH_CHECK(out.dtype() == q_dtype, "Output must have the same dtype as inputs");
         CHECK_DEVICE(out);
         TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
-        CHECK_SHAPE(out, batch_size, seqlen_q_og, num_heads_og, head_size_og);
-        if (head_size_og % 8 != 0) {
-            out = torch::empty_like(q_padded);
-        } else if (seqlenq_ngroups_swapped) {
-            out = out.reshape({batch_size, num_heads, seqlen_q, head_size_og}).transpose(1, 2);
-        }
+        CHECK_SHAPE(out, batch_size, seqlen_q, num_heads, head_size_og);
+        if (head_size_og % 8 != 0) { out = torch::empty_like(q_padded); }
     } else {
         out = torch::empty_like(q_padded);
     }
@@ -1514,10 +1478,6 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
 }
 } // namespace FLASH_NAMESPACE
 
-#ifndef FLASHATTENTION_DISABLE_PYBIND
-
-#include <torch/python.h>
-
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "FlashAttention";
     m.def("fwd", &FLASH_NAMESPACE::mha_fwd, "Forward pass");
@@ -1526,5 +1486,3 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("varlen_bwd", &FLASH_NAMESPACE::mha_varlen_bwd, "Backward pass (variable length)");
     m.def("fwd_kvcache", &FLASH_NAMESPACE::mha_fwd_kvcache, "Forward pass, with KV-cache");
 }
-
-#endif

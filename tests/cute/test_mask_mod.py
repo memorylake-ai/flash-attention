@@ -31,9 +31,28 @@ from flash_attn.cute.block_sparsity import (
     compute_dq_write_order_from_block_mask,
 )
 from flash_attn.cute.cache_utils import get_jit_cache
+from flash_attn.cute.compute_block_sparsity import compute_block_sparsity
 from flash_attn.cute import utils
-from mask_mod_definitions import get_mask_pair, random_doc_id_tensor
+from mask_mod_definitions import (
+    get_mask_pair,
+    get_vec_mask,
+    random_doc_id_tensor,
+    EXTRA_SCALAR_MASKS,
+    make_packed_mask_aux_tensor,
+)
 COMPUTE_CAPABILITY = torch.cuda.get_device_capability()[0]
+
+
+@cute.jit
+def scalar_limit_mask(batch, head, q_idx, kv_idx, seqlen_info, aux_tensors, aux_scalars):
+    return (q_idx >= kv_idx) & (kv_idx < cutlass.Int32(aux_scalars[0]))
+
+
+def flex_scalar_limit_mask(limit: int):
+    def mask_mod(b_idx, h_idx, q_idx, kv_idx):
+        return (q_idx >= kv_idx) & (kv_idx < limit)
+
+    return mask_mod
 
 
 @pytest.fixture(autouse=True)
@@ -46,6 +65,7 @@ def reset_torch_state():
 
     torch._dynamo.reset()
     torch.cuda.empty_cache()
+
 
 def create_tensors(
     batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, headdim, headdim_v, dtype
@@ -295,10 +315,11 @@ def _run_mask_test(
         doc_ids = random_doc_id_tensor(nheads, batch_size, doc_len, device="cuda").to(
             dtype=torch.int32, device="cuda"
         )
-        original_flex_mask = mask_mod_flex
+        doc_ids.__leading_dim__ = 2
+        doc_row = doc_ids[0, 0]  # (doc_len,); batch_size=1, all heads identical
 
-        def mask_mod_flex(b, h, q_idx, kv_idx, doc_ids=doc_ids):
-            return original_flex_mask(b, h, q_idx, kv_idx, doc_ids)
+        def mask_mod_flex(b, h, q_idx, kv_idx):
+            return doc_row[q_idx] == doc_row[kv_idx]
 
         aux_tensors_arg = [doc_ids]
     elif mask_name == "ima":
@@ -827,6 +848,122 @@ def test_parameterized_masks(
     )
 
 
+# =============================================================================
+# Vectorized mask_mod equality tests
+# Pattern: scalar mask is reference; vec mask at multiple __vec_size__ values
+# must produce bit-identical output.
+# =============================================================================
+
+# (mask_name, window_size, needs_aux)
+VEC_MASK_TEST_CASES = [
+    ("causal", None, False),
+    ("block_causal", None, False),
+    ("sliding_window", 128, False),
+    ("block_diagonal", None, False),
+    ("prefix_lm", None, False),
+    ("packed_aux", None, True),
+]
+
+# Vectorized mask_mod application is currently implemented for SM100/SM110 forward.
+# vec_size > 32 is only supported by packed_aux (other vec mods return shape-(1,) Uint32).
+VEC_MASK_SIZES_TO_CHECK_EQUALITY = [2, 8, 32, 128]
+
+
+def _run_mask_mod_only(q, k, v, mask_mod, aux_tensors, pack_gqa):
+    out = torch.empty_like(q)
+    _flash_attn_fwd(
+        q=q,
+        k=k,
+        v=v,
+        out=out,
+        lse=None,
+        cu_seqlens_q=None,
+        cu_seqlens_k=None,
+        seqused_q=None,
+        seqused_k=None,
+        page_table=None,
+        softmax_scale=1.0 / math.sqrt(q.shape[-1]),
+        causal=False,
+        softcap=None,
+        window_size_left=-1,
+        window_size_right=-1,
+        learnable_sink=None,
+        tile_mn=(128, 128),
+        pack_gqa=pack_gqa,
+        _arch=None,
+        score_mod=None,
+        mask_mod=mask_mod,
+        block_sparse_tensors=None,
+        return_lse=False,
+        aux_tensors=aux_tensors,
+    )
+    return out
+
+
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [(128, 128), (256, 256), (113, 203), (256, 512), (1024, 1024)],
+)
+@pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(1, 4), (4, 2)])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("mask_case", VEC_MASK_TEST_CASES)
+def test_cute_mask_mod_vectorized(
+    seqlen_q, seqlen_k, qhead_per_kvhead, num_kv_heads, dtype, mask_case
+):
+    """Tests equality between scalar and vectorized versions of mask mods."""
+    if COMPUTE_CAPABILITY not in (10, 11):
+        pytest.skip("vectorized mask_mod application is SM100/SM110-only")
+    mask_name, window_size, needs_aux = mask_case
+    torch.manual_seed(42)
+
+    num_heads = num_kv_heads * qhead_per_kvhead
+    pack_gqa = qhead_per_kvhead > 1
+    head_dim = 128
+    batch_size = 2
+
+    q = torch.randn(
+        batch_size, seqlen_q, num_heads, head_dim, device="cuda", dtype=dtype
+    )
+    k = torch.randn(
+        batch_size, seqlen_k, num_kv_heads, head_dim, device="cuda", dtype=dtype
+    )
+    v = torch.randn(
+        batch_size, seqlen_k, num_kv_heads, head_dim, device="cuda", dtype=dtype
+    )
+
+    if needs_aux:
+        aux_tensors = [make_packed_mask_aux_tensor(batch_size, seqlen_q, seqlen_k)]
+        scalar_mod = EXTRA_SCALAR_MASKS[mask_name]
+    else:
+        aux_tensors = None
+        scalar_mod, _ = get_mask_pair(
+            mask_name,
+            seqlen_q=seqlen_q,
+            seqlen_k=seqlen_k,
+            window_size=window_size,
+        )
+
+    out_ref = _run_mask_mod_only(q, k, v, scalar_mod, aux_tensors, pack_gqa)
+
+    for vec_size in VEC_MASK_SIZES_TO_CHECK_EQUALITY:
+        if vec_size > 32 and mask_name != "packed_aux":
+            continue
+        vec_mod = get_vec_mask(
+            mask_name,
+            seqlen_q=seqlen_q,
+            seqlen_k=seqlen_k,
+            window_size=window_size,
+            vec_size=vec_size,
+        )
+        if vec_mod is None:
+            pytest.skip(f"no vec mask for {mask_name}")
+        vec_mod.__vec_size__ = vec_size
+        out = _run_mask_mod_only(q, k, v, vec_mod, aux_tensors, pack_gqa)
+        assert torch.equal(out, out_ref), (
+            f"{mask_name} vec_size={vec_size}: output mismatch vs scalar reference"
+        )
+
+
 def test_sm100_block_sparse_sink_all_masked():
     """Block-sparse regression for the sink path"""
     if torch.cuda.get_device_capability()[0] != 10:
@@ -852,7 +989,7 @@ def test_sm100_block_sparse_sink_all_masked():
         block_size=(256, 128),
     )
     softmax_scale = 1.0 / math.sqrt(headdim)
-    _, lse = _flash_attn_fwd(
+    _, lse, *_ = _flash_attn_fwd(
         q=q,
         k=k,
         v=v,
@@ -961,7 +1098,7 @@ def test_sm100_block_sparse_coarse_blocks():
         block_size=(sparse_tile_m, tile_n),
     )
 
-    out_cute, _ = _flash_attn_fwd(
+    out_cute, _, *_ = _flash_attn_fwd(
         q=tensors["q"],
         k=tensors["k"],
         v=tensors["v"],
@@ -1067,7 +1204,7 @@ def test_sm100_block_sparse_coarse_blocks_mismatch():
         return normalized, pattern, q_subtile_factor
 
     with mock.patch("flash_attn.cute.interface.normalize_block_sparse_config", wrapped_normalize):
-        out_cute, _ = _flash_attn_fwd(
+        out_cute, _, *_ = _flash_attn_fwd(
             q=tensors["q"],
             k=tensors["k"],
             v=tensors["v"],
@@ -1334,7 +1471,7 @@ def test_sm90_block_sparse_infers_block_size():
         block_size=None,
     )
 
-    out, lse = _flash_attn_fwd(
+    out, lse, *_ = _flash_attn_fwd(
         q=q,
         k=k,
         v=v,
@@ -1436,7 +1573,7 @@ def test_sm90_block_sparse_explicit_192_block_size():
         block_size=(block_size_q, block_size_kv),
     )
 
-    out, lse = _flash_attn_fwd(
+    out, lse, *_ = _flash_attn_fwd(
         q=q,
         k=k,
         v=v,
@@ -1729,7 +1866,7 @@ def test_persistent_blocksparse_empty_tiles():
     k = torch.randn(batch_size, seqlen_k, nheads_kv, headdim, device="cuda", dtype=dtype)
     v = torch.randn(batch_size, seqlen_k, nheads_kv, headdim, device="cuda", dtype=dtype)
 
-    out, lse = _flash_attn_fwd(
+    out, lse, *_ = _flash_attn_fwd(
         q=q, k=k, v=v,
         out=torch.empty(batch_size, seqlen_q, nheads_q, headdim, device="cuda", dtype=dtype),
         lse=torch.empty(batch_size, nheads_q, seqlen_q, device="cuda", dtype=torch.float32),
@@ -2011,7 +2148,7 @@ def test_block_sparse_bwd_deterministic(seqlen_q, seqlen_k, mask_name, window_si
     window_size_right_arg = 0 if spt and mask_name == "sliding_window" else None
     mask_mod_arg = mask_mod_cute if not spt else None
 
-    out_cute, lse_cute = _flash_attn_fwd(
+    out_cute, lse_cute, *_ = _flash_attn_fwd(
         q=q,
         k=k,
         v=v,
@@ -2110,7 +2247,7 @@ def _setup_block_sparse_deterministic_validation_case():
         tile_n=tile_n,
         spt=False,
     )
-    out_cute, lse_cute = _flash_attn_fwd(
+    out_cute, lse_cute, *_ = _flash_attn_fwd(
         q=q,
         k=k,
         v=v,
@@ -2257,6 +2394,146 @@ def test_dq_write_order_document_mask(seqlen_q, seqlen_k, spt):
     _run_write_order_test(doc_mask, seqlen_q, seqlen_k, block_size=128, B=B, H=H, spt=spt)
 
 
+@pytest.mark.skipif(COMPUTE_CAPABILITY not in (10, 11), reason="SM100/SM110 SplitKV block sparse forward only")
+def test_block_sparse_splitkv_matches_unsplit():
+    torch.manual_seed(123)
+    batch_size = 1
+    nheads = 4
+    seqlen = 2048
+    headdim = 64
+    tile_m = 128
+    tile_n = 128
+    dtype = torch.bfloat16
+    sparse_tile_m = 2 * tile_m
+
+    mask_mod_cute, mask_mod_flex = get_mask_pair("causal", seqlen_q=seqlen, seqlen_k=seqlen)
+    tensors = create_tensors(
+        batch_size, seqlen, seqlen, nheads, nheads, headdim, headdim, dtype
+    )
+
+    bm = create_block_mask(
+        mask_mod_flex,
+        batch_size,
+        nheads,
+        seqlen,
+        seqlen,
+        device="cuda",
+        BLOCK_SIZE=(sparse_tile_m, tile_n),
+    )
+    (_, _, kv_mask_cnt, kv_mask_idx, full_kv_cnt, full_kv_idx, *_) = bm.as_tuple()
+    block_sparse_fwd = BlockSparseTensorsTorch(
+        mask_block_cnt=kv_mask_cnt,
+        mask_block_idx=kv_mask_idx,
+        full_block_cnt=full_kv_cnt,
+        full_block_idx=full_kv_idx,
+        block_size=(sparse_tile_m, tile_n),
+    )
+
+    out_unsplit, lse_unsplit, *_ = _flash_attn_fwd(
+        q=tensors["q"],
+        k=tensors["k"],
+        v=tensors["v"],
+        out=tensors["out"].clone(),
+        lse=tensors["lse"].clone(),
+        softmax_scale=1.0 / math.sqrt(headdim),
+        causal=False,
+        mask_mod=mask_mod_cute,
+        block_sparse_tensors=block_sparse_fwd,
+        num_splits=1,
+        return_lse=True,
+    )
+    out_split, lse_split, *_ = _flash_attn_fwd(
+        q=tensors["q"],
+        k=tensors["k"],
+        v=tensors["v"],
+        out=tensors["out"].clone(),
+        lse=tensors["lse"].clone(),
+        softmax_scale=1.0 / math.sqrt(headdim),
+        causal=False,
+        mask_mod=mask_mod_cute,
+        block_sparse_tensors=block_sparse_fwd,
+        num_splits=3,
+        return_lse=True,
+    )
+
+    out_ref = compute_reference_flex_attn(tensors, mask_mod_flex, block_size=(sparse_tile_m, tile_n))
+    out_ref_fp32 = compute_reference_flex_attn(
+        {name: tensor.float() for name, tensor in tensors.items()},
+        mask_mod_flex,
+        block_size=(sparse_tile_m, tile_n),
+    )
+
+    assert_fwd_matches_reference(out_split, out_ref_fp32, out_ref)
+    assert torch.allclose(lse_split, lse_unsplit, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.skipif(COMPUTE_CAPABILITY not in (10, 11), reason="SM100/SM110 SplitKV block sparse forward only")
+def test_block_sparse_splitkv_oversplit_sparse_blocks():
+    torch.manual_seed(321)
+    batch_size = 1
+    nheads = 4
+    seqlen_q = 513
+    seqlen_k = 1024
+    headdim = 64
+    tile_m = 128
+    tile_n = 128
+    dtype = torch.bfloat16
+    sparse_tile_m = 2 * tile_m
+
+    mask_mod_cute, mask_mod_flex = get_mask_pair("block_diagonal", seqlen_q=seqlen_q, seqlen_k=seqlen_k)
+    tensors = create_tensors(
+        batch_size, seqlen_q, seqlen_k, nheads, nheads, headdim, headdim, dtype
+    )
+    bm = create_block_mask(
+        mask_mod_flex,
+        batch_size,
+        nheads,
+        seqlen_q,
+        seqlen_k,
+        device="cuda",
+        BLOCK_SIZE=(sparse_tile_m, tile_n),
+    )
+    (_, _, kv_mask_cnt, kv_mask_idx, full_kv_cnt, full_kv_idx, *_) = bm.as_tuple()
+    block_sparse_fwd = BlockSparseTensorsTorch(
+        mask_block_cnt=kv_mask_cnt,
+        mask_block_idx=kv_mask_idx,
+        full_block_cnt=full_kv_cnt,
+        full_block_idx=full_kv_idx,
+        block_size=(sparse_tile_m, tile_n),
+    )
+
+    out_unsplit, _, *_ = _flash_attn_fwd(
+        q=tensors["q"],
+        k=tensors["k"],
+        v=tensors["v"],
+        out=tensors["out"].clone(),
+        lse=tensors["lse"].clone(),
+        softmax_scale=1.0 / math.sqrt(headdim),
+        causal=False,
+        mask_mod=mask_mod_cute,
+        block_sparse_tensors=block_sparse_fwd,
+        num_splits=1,
+        return_lse=True,
+    )
+    out_split, _, *_ = _flash_attn_fwd(
+        q=tensors["q"],
+        k=tensors["k"],
+        v=tensors["v"],
+        out=tensors["out"].clone(),
+        lse=tensors["lse"].clone(),
+        softmax_scale=1.0 / math.sqrt(headdim),
+        causal=False,
+        mask_mod=mask_mod_cute,
+        block_sparse_tensors=block_sparse_fwd,
+        num_splits=8,
+        return_lse=True,
+    )
+
+    assert not torch.isnan(out_split).any()
+    assert torch.isfinite(out_split).all()
+    assert torch.allclose(out_split, out_unsplit, atol=4e-3, rtol=4e-3)
+
+
 def test_compact_block_sparse_indices():
     """Test that compact block sparse index tensors (idx.shape[3] < n_blocks) work correctly.
 
@@ -2307,7 +2584,7 @@ def test_compact_block_sparse_indices():
         block_size=(sparse_tile_m, tile_n),
     )
 
-    out_compact, _ = _flash_attn_fwd(
+    out_compact, _, *_ = _flash_attn_fwd(
         q=tensors["q"], k=tensors["k"], v=tensors["v"],
         out=tensors["out"].clone(), lse=tensors["lse"].clone(),
         softmax_scale=1.0 / math.sqrt(headdim),
@@ -2325,7 +2602,7 @@ def test_compact_block_sparse_indices():
         block_size=(sparse_tile_m, tile_n),
     )
 
-    out_full, _ = _flash_attn_fwd(
+    out_full, _, *_ = _flash_attn_fwd(
         q=tensors["q"], k=tensors["k"], v=tensors["v"],
         out=tensors["out"].clone(), lse=tensors["lse"].clone(),
         softmax_scale=1.0 / math.sqrt(headdim),
@@ -2341,6 +2618,65 @@ def test_compact_block_sparse_indices():
         f"Compact and full block sparse outputs differ: "
         f"max diff = {(out_compact - out_full).abs().max().item():.2e}"
     )
+
+
+@pytest.mark.parametrize("limit", [64, 96])
+def test_flash_attn_fwd_mask_mod_aux_scalars_matches_flex(limit):
+    torch.manual_seed(0)
+    tensors = create_tensors(1, 128, 128, 4, 4, 64, 64, torch.bfloat16)
+    out, _, *_ = _flash_attn_fwd(
+        tensors["q"],
+        tensors["k"],
+        tensors["v"],
+        softmax_scale=1.0 / math.sqrt(64),
+        return_lse=True,
+        mask_mod=scalar_limit_mask,
+        aux_scalars=[cutlass.Int32(limit)],
+    )
+    expected = compute_reference_flex_attn(tensors, flex_scalar_limit_mask(limit))
+    torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2)
+
+
+def test_flash_attn_bwd_mask_mod_aux_scalars_produces_grads():
+    torch.manual_seed(1)
+    q, k, v = [
+        x.requires_grad_()
+        for x in (
+            torch.randn(1, 128, 4, 64, device="cuda", dtype=torch.bfloat16),
+            torch.randn(1, 128, 4, 64, device="cuda", dtype=torch.bfloat16),
+            torch.randn(1, 128, 4, 64, device="cuda", dtype=torch.bfloat16),
+        )
+    ]
+    out, _ = flash_attn_func(
+        q,
+        k,
+        v,
+        softmax_scale=1.0 / math.sqrt(q.shape[-1]),
+        return_lse=True,
+        mask_mod=scalar_limit_mask,
+        aux_scalars=[cutlass.Int32(64)],
+    )
+    out.float().square().mean().backward()
+    assert q.grad is not None and torch.isfinite(q.grad).all()
+    assert k.grad is not None and torch.isfinite(k.grad).all()
+    assert v.grad is not None and torch.isfinite(v.grad).all()
+
+
+def test_compute_block_sparsity_mask_mod_aux_scalars_runs():
+    blocks = compute_block_sparsity(
+        tile_m=64,
+        tile_n=128,
+        batch_size=1,
+        num_heads=1,
+        seqlen_q=128,
+        seqlen_k=128,
+        mask_mod=scalar_limit_mask,
+        aux_tensors=None,
+        device="cuda",
+        aux_scalars=[cutlass.Int32(64)],
+    )
+    assert blocks.mask_block_cnt.shape == (1, 1, 2)
+    assert blocks.mask_block_idx.shape == (1, 1, 2, 1)
 
 
 if __name__ == "__main__":
