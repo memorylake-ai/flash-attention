@@ -1478,6 +1478,8 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
 }
 } // namespace FLASH_NAMESPACE
 
+#ifndef FLASHATTENTION_DISABLE_PYBIND
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "FlashAttention";
     m.def("fwd", &FLASH_NAMESPACE::mha_fwd, "Forward pass");
@@ -1486,3 +1488,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("varlen_bwd", &FLASH_NAMESPACE::mha_varlen_bwd, "Backward pass (variable length)");
     m.def("fwd_kvcache", &FLASH_NAMESPACE::mha_fwd_kvcache, "Forward pass, with KV-cache");
 }
+
+#endif
